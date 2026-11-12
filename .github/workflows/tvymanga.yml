@@ -1,0 +1,76 @@
+name: TvyManga personal repo
+
+on:
+  push:
+    branches: [tvymanga]
+    paths:
+      - 'src/es/tvymanga/**'
+      - '.github/workflows/tvymanga.yml'
+      - '.github/scripts/tvymanga-publish.py'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: tvymanga-repo
+  cancel-in-progress: true
+
+jobs:
+  build-publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-java@77dd5b2ce225ea11469928ac317850245a74ae78 # v6.2.0
+        with:
+          java-version: 25
+          distribution: temurin
+
+      - uses: gradle/actions/setup-gradle@8da46b539cd8fe6ab27ca75128919a18d757604c # v6.4.1
+
+      - name: Prepare signing key
+        env:
+          SIGNING_KEY: ${{ secrets.SIGNING_KEY }}
+          SECRET_ALIAS: ${{ secrets.ALIAS }}
+          SECRET_PASSWORD: ${{ secrets.KEY_STORE_PASSWORD }}
+        run: |
+          if [ -n "$SIGNING_KEY" ]; then
+            echo "$SIGNING_KEY" | base64 -d > signingkey.jks
+            echo "ALIAS=$SECRET_ALIAS" >> "$GITHUB_ENV"
+            echo "KEY_STORE_PASSWORD=$SECRET_PASSWORD" >> "$GITHUB_ENV"
+            echo "KEY_PASSWORD=$SECRET_PASSWORD" >> "$GITHUB_ENV"
+          else
+            echo "::warning::No SIGNING_KEY secret: using a throwaway key, so every build has a different signature and Mihon can not update in place."
+            PW="$(openssl rand -hex 12)"
+            keytool -genkeypair -keystore signingkey.jks -alias tvymanga -keyalg RSA -keysize 2048 \
+              -validity 10000 -storepass "$PW" -keypass "$PW" -dname "CN=tvymanga"
+            echo "ALIAS=tvymanga" >> "$GITHUB_ENV"
+            echo "KEY_STORE_PASSWORD=$PW" >> "$GITHUB_ENV"
+            echo "KEY_PASSWORD=$PW" >> "$GITHUB_ENV"
+          fi
+
+      - name: Build
+        run: ./gradlew :src:es:tvymanga:assembleRelease
+
+      - name: Signing key fingerprint
+        run: |
+          FP="$(keytool -exportcert -alias "$ALIAS" -keystore signingkey.jks -storepass "$KEY_STORE_PASSWORD" | sha256sum | cut -d' ' -f1)"
+          echo "SIGNING_FINGERPRINT=$FP" >> "$GITHUB_ENV"
+
+      - name: Publish to repo branch
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git clone --depth 1 --branch repo "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" repo-out \
+            || { mkdir repo-out && git -C repo-out init -q -b repo && git -C repo-out remote add origin "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"; }
+          python3 .github/scripts/tvymanga-publish.py repo-out
+          cd repo-out
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "Publish TvyManga" || exit 0
+          git push origin repo
