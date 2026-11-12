@@ -15,9 +15,9 @@ class RenderedDto(val rendered: String = "")
 
 @Serializable
 class PostDto(
-    val id: Int,
+    val id: Int = 0,
     val date: String = "",
-    val slug: String,
+    val slug: String = "",
     val title: RenderedDto = RenderedDto(),
     val categories: List<Int> = emptyList(),
     val content: RenderedDto? = null,

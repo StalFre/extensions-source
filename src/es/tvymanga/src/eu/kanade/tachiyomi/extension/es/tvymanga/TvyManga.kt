@@ -27,8 +27,13 @@ import kotlinx.coroutines.sync.withLock
 import kotlinx.serialization.json.JsonElement
 import okhttp3.HttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrl
+import okhttp3.Interceptor
+import okhttp3.OkHttpClient
+import okhttp3.Request
+import okhttp3.Response
 import org.jsoup.Jsoup
 import org.jsoup.parser.Parser
+import java.io.IOException
 import java.time.format.DateTimeFormatter
 import java.util.Locale
 
@@ -140,6 +145,40 @@ abstract class TvyManga :
     private fun Series.toSManga() = SManga.create().apply {
         url = this@toSManga.url
         title = this@toSManga.title
+        thumbnail_url = coverUrl()
+    }
+
+    /** Resolved by [coverInterceptor]: the newest chapter's post, whose first image is the thumbnail the site shows. */
+    private fun Series.coverUrl(): String? {
+        val url = postsUrl().addQueryParameter("per_page", "1").addQueryParameter("_fields", "content")
+        when {
+            categoryId != null -> url.addQueryParameter("categories", categoryId.toString())
+            else -> url.addQueryParameter("slug", loosePosts.maxByOrNull { it.date }?.slug ?: return null)
+        }
+        return url.addQueryParameter(COVER_PARAM, "1").build().toString()
+    }
+
+    override fun OkHttpClient.Builder.configureClient(): OkHttpClient.Builder = addInterceptor(::coverInterceptor)
+
+    private fun coverInterceptor(chain: Interceptor.Chain): Response {
+        val request = chain.request()
+        if (request.url.queryParameter(COVER_PARAM) == null) return chain.proceed(request)
+
+        val apiRequest = request.newBuilder()
+            .url(request.url.newBuilder().removeAllQueryParameters(COVER_PARAM).build())
+            .header("Accept", "application/json")
+            .build()
+        val html = chain.proceed(apiRequest).use { it.body.string() }
+            .parseAs<List<PostDto>>().firstOrNull()?.content?.rendered.orEmpty()
+        val cover = Jsoup.parseBodyFragment(html, baseUrl).select("img")
+            .map { it.absUrl("data-src").ifEmpty { it.absUrl("src") } }
+            .firstOrNull { it.isNotEmpty() }
+            ?: throw IOException("Sin portada")
+        // Image hosts like imgur reject foreign Referers, so only keep the User-Agent.
+        val imageRequest = Request.Builder().url(cover)
+            .apply { request.header("User-Agent")?.let { header("User-Agent", it) } }
+            .build()
+        return chain.proceed(imageRequest)
     }
 
     private fun languageMatches(lang: String, wanted: String) = wanted == LANG_ALL || lang == wanted
@@ -205,11 +244,26 @@ abstract class TvyManga :
         val catalog = catalog()
         val series = catalog.seriesOf(manga) ?: throw Exception("Serie no encontrada, vuelve a buscarla")
 
+        val fields = "id,date,slug,title"
+        val ownKey = series.key.substringAfter(':')
+        val matchKeys = mutableSetOf(ownKey)
+        fun PostDto.nameKey() = seriesName(title.rendered.decodeHtml()).toKey()
+        // The site sometimes files a chapter under another series' category: drop titles that name a different known series.
+        fun PostDto.belongsElsewhere() = catalog.byKey["${series.lang}:${nameKey()}"].let { it != null && it !== series } && nameKey() !in matchKeys
+
         val posts = buildList {
             series.categoryId?.let { id ->
-                addAll(fetchAllPages<PostDto>(postsUrl().addQueryParameter("categories", id.toString()).addQueryParameter("_fields", "id,date,slug,title")))
+                val catPosts = fetchAllPages<PostDto>(postsUrl().addQueryParameter("categories", id.toString()).addQueryParameter("_fields", fields))
+                // Category names often differ from chapter titles ("KANOJO OKARISHIMASU" vs "Kanojo, Okarishimasu 447").
+                catPosts.groupingBy { it.nameKey() }.eachCount().maxByOrNull { it.value }?.key?.let(matchKeys::add)
+                addAll(catPosts.filterNot { it.belongsElsewhere() })
             }
             addAll(series.loosePosts)
+            if (series.lang == LANG_ES) {
+                // Picks up this series' chapters that were misfiled under other categories.
+                val search = postsUrl().addQueryParameter("search", series.title).addQueryParameter("_fields", fields)
+                addAll(fetchAllPages<PostDto>(search, maxPages = 3).filter { it.nameKey() in matchKeys })
+            }
         }.distinctBy { it.id }.sortedByDescending { it.date }
 
         val chapterList = posts.map { post ->
@@ -226,9 +280,7 @@ abstract class TvyManga :
             title = series.title
             status = SManga.UNKNOWN
             description = "Capítulos: ${chapterList.size}" + if (series.lang == LANG_EN) "\nIdioma: Inglés" else ""
-            if (thumbnail_url.isNullOrBlank()) {
-                thumbnail_url = posts.firstOrNull()?.let { runCatching { pageUrls(it.slug).firstOrNull() }.getOrNull() }
-            }
+            thumbnail_url = series.coverUrl()
             initialized = true
         }
 
@@ -259,10 +311,10 @@ abstract class TvyManga :
 
     private fun postsUrl() = apiUrl("posts")
 
-    private suspend inline fun <reified T> fetchAllPages(url: HttpUrl.Builder): List<T> {
+    private suspend inline fun <reified T> fetchAllPages(url: HttpUrl.Builder, maxPages: Int = Int.MAX_VALUE): List<T> {
         url.setQueryParameter("per_page", "100")
         val first = client.get(url.setQueryParameter("page", "1").build(), Fetch.XHR)
-        val totalPages = first.header("X-WP-TotalPages")?.toIntOrNull() ?: 1
+        val totalPages = minOf(first.header("X-WP-TotalPages")?.toIntOrNull() ?: 1, maxPages)
         val firstItems = first.parseAs<List<T>>()
         if (totalPages <= 1) return firstItems
         val pageUrls = (2..totalPages).map { url.setQueryParameter("page", it.toString()).build() }
@@ -295,6 +347,7 @@ abstract class TvyManga :
         const val LANG_ALL = "all"
 
         private const val LANG_PARAM = "tvy"
+        private const val COVER_PARAM = "tvycover"
         private const val PREF_LANG_KEY = "manga_language"
         private const val PAGE_SIZE = 30
         private const val CATALOG_TTL_MS = 30 * 60 * 1000L
