@@ -248,6 +248,7 @@ abstract class TvyManga :
         val ownKey = series.key.substringAfter(':')
         val matchKeys = mutableSetOf(ownKey)
         fun PostDto.nameKey() = seriesName(title.rendered.decodeHtml()).toKey()
+
         // The site sometimes files a chapter under another series' category: drop titles that name a different known series.
         fun PostDto.belongsElsewhere() = catalog.byKey["${series.lang}:${nameKey()}"].let { it != null && it !== series } && nameKey() !in matchKeys
 
